@@ -1,93 +1,92 @@
 import logging
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from tqdm import tqdm
 from typing import List, Dict, Optional
-
-from app.config import Config
+import os
 
 logger = logging.getLogger(__name__)
 
 class YouTubeService:
     def __init__(self, api_key: str = None):
-        self.api_key = api_key or Config.API_KEY
+        self.api_key = api_key or os.getenv('YOUTUBE_API_KEY')
+        if not self.api_key:
+            raise ValueError("YouTube API key not configured")
+        
         try:
             self.youtube = build('youtube', 'v3', developerKey=self.api_key)
-            logger.info("YouTube API connection established")
+            logger.info("YouTube API client initialized")
         except Exception as e:
-            logger.error(f"Error connecting to YouTube API: {str(e)}")
+            logger.error(f"Error initializing YouTube API: {str(e)}")
             raise
 
-    def extract_comments(self, video_id: str, max_results: int = None) -> List[Dict]:
-        max_results = max_results or Config.MAX_COMMENTS
+    def extract_comments(self, video_id: str, max_results: int = 50) -> List[Dict]:
+        """Extrae comentarios de YouTube con manejo optimizado de memoria"""
         comments = []
+        if not video_id:
+            return comments
 
         try:
             request = self.youtube.commentThreads().list(
                 part="snippet",
                 videoId=video_id,
-                maxResults=100,
+                maxResults=min(100, max_results),
                 textFormat="plainText"
             )
 
-            with tqdm(total=max_results, desc="Extracting comments") as pbar:
-                while request and len(comments) < max_results:
-                    response = request.execute()
+            while request and len(comments) < max_results:
+                response = request.execute()
+                
+                for item in response.get('items', []):
+                    snippet = item['snippet']['topLevelComment']['snippet']
+                    comments.append({
+                        'author': snippet['authorDisplayName'],
+                        'comment': snippet['textDisplay'],
+                        'date': snippet['publishedAt'],
+                        'likes': snippet.get('likeCount', 0)
+                    })
+                    
+                    if len(comments) >= max_results:
+                        break
 
-                    for item in response['items']:
-                        snippet = item['snippet']['topLevelComment']['snippet']
-                        comment = {
-                            'author': snippet['authorDisplayName'],
-                            'comment': snippet['textDisplay'],
-                            'date': snippet['publishedAt'],
-                            'likes': snippet.get('likeCount', 0),
-                            'id': item['id']
-                        }
-                        comments.append(comment)
-                        pbar.update(1)
-
-                        if len(comments) >= max_results:
-                            break
-
-                    if 'nextPageToken' in response and len(comments) < max_results:
-                        request = self.youtube.commentThreads().list(
-                            part="snippet",
-                            videoId=video_id,
-                            pageToken=response['nextPageToken'],
-                            maxResults=100,
-                            textFormat="plainText"
-                        )
-                    else:
-                        request = None
+                request = self.youtube.commentThreads().list(
+                    part="snippet",
+                    videoId=video_id,
+                    pageToken=response.get('nextPageToken'),
+                    maxResults=min(100, max_results - len(comments)),
+                    textFormat="plainText"
+                ) if response.get('nextPageToken') else None
 
         except HttpError as e:
-            logger.error(f"YouTube API HTTP error: {str(e)}")
+            error_msg = f"YouTube API error: {str(e)}"
             if "quotaExceeded" in str(e):
-                logger.error("API quota exceeded. Try tomorrow or use another API key.")
+                error_msg += " - Daily quota exceeded"
+            logger.error(error_msg)
         except Exception as e:
-            logger.error(f"Unexpected error extracting comments: {str(e)}")
+            logger.error(f"Unexpected error: {str(e)}")
 
-        logger.info(f"Extracted {len(comments)} comments from video {video_id}")
-        return comments
+        return comments[:max_results]
 
     def get_video_details(self, video_id: str) -> Optional[Dict]:
+        """Obtiene detalles del video con caché básica"""
+        if not video_id:
+            return None
+
         try:
             response = self.youtube.videos().list(
                 part="snippet,statistics",
                 id=video_id
             ).execute()
 
-            if response['items']:
-                video_data = response['items'][0]
+            if response.get('items'):
+                item = response['items'][0]
                 return {
-                    'title': video_data['snippet']['title'],
-                    'channel': video_data['snippet']['channelTitle'],
-                    'published_at': video_data['snippet']['publishedAt'],
-                    'view_count': video_data['statistics'].get('viewCount', 0),
-                    'like_count': video_data['statistics'].get('likeCount', 0),
-                    'comment_count': video_data['statistics'].get('commentCount', 0)
+                    'title': item['snippet']['title'],
+                    'channel': item['snippet']['channelTitle'],
+                    'published_at': item['snippet']['publishedAt'],
+                    'view_count': item['statistics'].get('viewCount', 0),
+                    'like_count': item['statistics'].get('likeCount', 0)
                 }
-            return None
         except Exception as e:
             logger.error(f"Error getting video details: {str(e)}")
-            return None
+        
+        return None

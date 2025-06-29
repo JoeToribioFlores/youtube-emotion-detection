@@ -7,20 +7,18 @@
       "config": {
         "runtime": "python3.9",
         "maxLambdaSize": "50mb",
-        "includeFiles": ["backend/**", "models/**", "utils/**"]
+        "includeFiles": ["backend/**", "services/**", "config/**"]
       }
     }
   ],
   "routes": [
     {
       "src": "/api/(.*)",
-      "dest": "backend/main.py",
-      "methods": ["GET", "POST"]
+      "dest": "backend/main.py"
     },
     {
       "src": "/(.*)",
-      "status": 404,
-      "dest": "This route is not available"
+      "dest": "backend/main.py"
     }
   ]
 }

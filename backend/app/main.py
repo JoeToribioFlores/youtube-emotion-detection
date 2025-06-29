@@ -1,18 +1,25 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse
 from typing import Optional
 import logging
 import pandas as pd
-import os
 import re
+import asyncio
 from tempfile import NamedTemporaryFile
+import os
 
-# Importaciones relativas para compatibilidad con Vercel
-from .services.youtube_service import YouTubeService
-from .services.nlp_service import TextPreprocessor, EmotionAnalyzer
-from .services.visualization import VisualizationService
-from .config import Config
+# Manejo de imports para compatibilidad con Vercel
+try:
+    from services.youtube_service import YouTubeService
+    from services.nlp_service import TextPreprocessor, EmotionAnalyzer
+    from services.visualization import VisualizationService
+    from config import Config
+except ImportError:
+    from .services.youtube_service import YouTubeService
+    from .services.nlp_service import TextPreprocessor, EmotionAnalyzer
+    from .services.visualization import VisualizationService
+    from .config import Config
 
 # Configuración de logging
 logging.basicConfig(
@@ -24,7 +31,9 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="YouTube Emotion Detection API",
     description="API for analyzing emotions in YouTube comments",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc"
 )
 
 # Configuración de CORS
@@ -39,76 +48,94 @@ app.add_middleware(
 @app.get("/api/analyze")
 async def analyze_video(
     video_url: str = Query(..., description="YouTube video URL"),
-    max_comments: Optional[int] = Query(100, description="Maximum number of comments to analyze"),
+    max_comments: Optional[int] = Query(50, description="Maximum number of comments to analyze (max: 50)"),
     chart_type: Optional[str] = Query("bar", description="Type of chart to generate (bar or pie)")
 ):
+    """
+    Analyze emotions in YouTube comments and return visualization
+    """
     try:
-        # Extraer el ID del video de la URL
-        video_id = extract_video_id(video_url)
-        if not video_id:
-            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+        return await asyncio.wait_for(
+            _perform_analysis(video_url, max_comments, chart_type),
+            timeout=25.0
+        )
+    except asyncio.TimeoutError:
+        logger.error("Analysis timed out")
+        raise HTTPException(status_code=504, detail="Analysis timed out")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
-        # Inicializar servicios
-        youtube = YouTubeService()
-        preprocessor = TextPreprocessor()
-        analyzer = EmotionAnalyzer()
-        visualizer = VisualizationService()
+async def _perform_analysis(video_url: str, max_comments: int, chart_type: str):
+    """Core analysis logic"""
+    logger.info(f"Starting analysis for video: {video_url}")
+    
+    video_id = extract_video_id(video_url)
+    if not video_id:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
-        # Obtener comentarios
-        comments = youtube.extract_comments(video_id, max_comments)
-        if not comments:
-            raise HTTPException(status_code=404, detail="No comments found for this video")
+    youtube = YouTubeService()
+    preprocessor = TextPreprocessor()
+    analyzer = EmotionAnalyzer()
+    visualizer = VisualizationService()
 
-        # Analizar emociones
-        results = []
-        for comment in comments:
-            processed_text = preprocessor.preprocess(comment['comment'])
-            emotion_result = analyzer.analyze(processed_text)
-            
-            results.append({
-                'author': comment['author'],
-                'comment': comment['comment'],
-                'processed_comment': processed_text,
-                'emotion': emotion_result['emotion'],
-                'confidence': emotion_result['confidence'],
-                'date': comment['date'],
-                'likes': comment['likes']
-            })
+    # Obtener comentarios
+    comments = youtube.extract_comments(video_id, min(max_comments, 50))
+    if not comments:
+        raise HTTPException(status_code=404, detail="No comments found for this video")
 
-        df = pd.DataFrame(results)
+    # Procesar comentarios
+    results = []
+    for comment in comments:
+        processed_text = preprocessor.preprocess(comment['comment'])
+        emotion_result = analyzer.analyze(processed_text)
+        
+        results.append({
+            'author': comment['author'],
+            'comment': comment['comment'],
+            'processed_comment': processed_text,
+            'emotion': emotion_result['emotion'],
+            'confidence': emotion_result['confidence'],
+            'date': comment['date'],
+            'likes': comment['likes']
+        })
 
-        # Generar visualización
-        video_details = youtube.get_video_details(video_id)
-        title = f"Emotions in comments for: {video_details.get('title', video_id)}" if video_details else None
+    df = pd.DataFrame(results)
+    video_details = youtube.get_video_details(video_id)
+    title = f"Emotions in comments for: {video_details.get('title', video_id)}" if video_details else None
 
-        # Usar archivo temporal para la imagen
-        with NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
-            chart_path = tmp_file.name
-            
+    # Generar gráfico en memoria
+    with NamedTemporaryFile(delete=True, suffix='.png') as tmp_file:
+        chart_path = tmp_file.name
+        
+        try:
             if chart_type.lower() == "pie":
                 visualizer.create_pie_chart(df, title, output_path=chart_path)
             else:
                 visualizer.create_emotion_distribution_plot(df, title, output_path=chart_path)
-
-            # Devolver la imagen generada
-            return FileResponse(
-                chart_path,
-                media_type='image/png',
-                headers={'Cache-Control': 'no-store'}
-            )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in analysis: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+            
+            with open(chart_path, 'rb') as f:
+                image_data = f.read()
+            
+            logger.info(f"Analysis completed for video: {video_id}")
+            return Response(content=image_data, media_type='image/png')
+        
+        except Exception as e:
+            logger.error(f"Chart generation error: {str(e)}")
+            raise HTTPException(status_code=500, detail="Error generating visualization")
 
 def extract_video_id(url: str) -> Optional[str]:
     """Extrae el ID de un video de YouTube desde su URL"""
+    if not url or not isinstance(url, str):
+        return None
+        
     patterns = [
         r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/watch\?v=([^&]+)',
         r'(?:https?:\/\/)?(?:www\.)?youtu\.be\/([^?]+)',
-        r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/embed\/([^\/]+)'
+        r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/embed\/([^\/]+)',
+        r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/shorts\/([^\/\?]+)'
     ]
     
     for pattern in patterns:
@@ -119,16 +146,27 @@ def extract_video_id(url: str) -> Optional[str]:
 
 @app.get("/api/health")
 async def health_check():
+    """Health check endpoint"""
     return {"status": "ok", "message": "API is running"}
 
 @app.get("/")
 async def root():
+    """Root endpoint with API documentation"""
     return JSONResponse(
         content={
             "message": "YouTube Emotion Detection API",
             "endpoints": {
-                "/api/analyze": "POST - Analyze YouTube comments",
-                "/api/health": "GET - Health check"
+                "/api/analyze": {
+                    "description": "Analyze YouTube comments",
+                    "parameters": {
+                        "video_url": "string (required)",
+                        "max_comments": "int (optional, default: 50)",
+                        "chart_type": "string (optional, 'bar' or 'pie')"
+                    }
+                },
+                "/api/health": "GET - Service health check",
+                "/api/docs": "Interactive API documentation",
+                "/api/redoc": "Alternative API documentation"
             }
         }
     )

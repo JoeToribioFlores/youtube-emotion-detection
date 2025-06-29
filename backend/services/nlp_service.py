@@ -3,95 +3,82 @@ import logging
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
-from typing import Dict, List, Any
-from transformers import pipeline
-from tqdm import tqdm
-
-from app.config import Config
+from typing import Dict, Any
+import os
 
 logger = logging.getLogger(__name__)
+
+# Descarga recursos NLTK solo una vez
+try:
+    nltk.data.find('tokenizers/punkt')
+    nltk.data.find('corpora/stopwords')
+except:
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
 
 class TextPreprocessor:
     def __init__(self, language: str = "spanish"):
         self.language = language
-        try:
-            nltk.download('punkt', quiet=True)
-            nltk.download('stopwords', quiet=True)
-            self.stop_words = set(stopwords.words(self.language))
-        except Exception as e:
-            logger.warning(f"Error downloading NLTK resources: {str(e)}")
-            self.stop_words = set()
+        self.stop_words = set(stopwords.words(self.language)) if language in stopwords.fileids() else set()
 
     def preprocess(self, text: str) -> str:
-        if not text or not isinstance(text, str):
+        """Preprocesamiento de texto optimizado"""
+        if not isinstance(text, str):
             return ""
 
-        try:
-            text = text.lower()
-            text = re.sub(r'https?://\S+|www\.\S+', '', text)
-            text = re.sub(r'<.*?>', '', text)
-            text = re.sub(r'[^\w\s]', '', text)
-            text = re.sub(r'\d+', '', text)
-
-            try:
-                tokens = word_tokenize(text, language=self.language)
-            except:
-                tokens = text.split()
-
-            tokens = [word for word in tokens if word not in self.stop_words]
-            return ' '.join(tokens)
-        except Exception as e:
-            logger.error(f"Error preprocessing text: {str(e)}")
-            return text
-
-class EmotionAnalyzer:
-    def __init__(self, model_name: str = None, language: str = None):
-        self.language = language or Config.DEFAULT_LANGUAGE
-        self.model_name = model_name or (
-            Config.MODEL_SPANISH if self.language == "spanish" 
-            else Config.MODEL_ENGLISH
-        )
+        text = text.lower().strip()
+        text = re.sub(r'<[^>]+>|https?://\S+|www\.\S+|[^\w\s]|\d+', ' ', text)
         
         try:
-            self.classifier = pipeline(
-                "text-classification",
-                model=self.model_name,
-                return_all_scores=True
-            )
-            logger.info(f"Model {self.model_name} loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading emotion model: {str(e)}")
-            raise
+            tokens = word_tokenize(text, language=self.language)
+        except:
+            tokens = text.split()
+
+        return ' '.join(word for word in tokens if word not in self.stop_words)
+
+class EmotionAnalyzer:
+    def __init__(self):
+        """Carga el modelo solo cuando sea necesario"""
+        self.model = None
+        self.model_loaded = False
+
+    def _load_model(self):
+        """Carga perezosa del modelo para ahorrar memoria"""
+        if not self.model_loaded:
+            from transformers import pipeline
+            model_name = os.getenv('NLP_MODEL', 'finiteautomata/beto-sentiment-analysis')
+            try:
+                self.model = pipeline(
+                    "text-classification",
+                    model=model_name,
+                    return_all_scores=True,
+                    device=-1  # Usa CPU para compatibilidad con Vercel
+                )
+                self.model_loaded = True
+            except Exception as e:
+                logger.error(f"Error loading model: {str(e)}")
+                raise
 
     def analyze(self, text: str) -> Dict[str, Any]:
-        if not text or not isinstance(text, str) or len(text.strip()) == 0:
-            return {
-                'emotion': 'unknown',
-                'confidence': 0.0,
-                'all_emotions': []
-            }
+        """Análisis de emociones con manejo de errores"""
+        if not isinstance(text, str) or not text.strip():
+            return {'emotion': 'neutral', 'confidence': 0.5}
 
         try:
-            max_length = 512
-            if len(text) > max_length:
-                text = text[:max_length]
-
-            result = self.classifier(text)
-            main_emotion = max(result[0], key=lambda x: x['score'])
-
+            self._load_model()
+            text = text[:512]  # Limita el tamaño para el modelo
+            
+            result = self.model(text)[0]
+            main_emotion = max(result, key=lambda x: x['score'])
+            
             return {
                 'emotion': main_emotion['label'],
                 'confidence': float(main_emotion['score']),
-                'all_emotions': [
-                    {'emotion': e['label'], 'score': float(e['score'])}
-                    for e in result[0]
+                'details': [
+                    {'label': e['label'], 'score': float(e['score'])}
+                    for e in result
                 ]
             }
         except Exception as e:
-            logger.error(f"Error analyzing emotions: {str(e)}")
-            return {
-                'emotion': 'error',
-                'confidence': 0.0,
-                'all_emotions': [],
-                'error': str(e)
-            }
+            logger.error(f"Analysis error: {str(e)}")
+            return {'emotion': 'error', 'confidence': 0.0, 'error': str(e)}
