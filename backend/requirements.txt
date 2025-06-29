@@ -1,7 +1,7 @@
 fastapi==0.95.2
 uvicorn==0.22.0
 python-dotenv==1.0.0
-pandas==2.0.2
+pandas==1.5.3  # Versión más ligera
 numpy==1.24.3
 matplotlib==3.7.1
 seaborn==0.12.2
