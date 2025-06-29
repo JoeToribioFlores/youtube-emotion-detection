@@ -2,19 +2,25 @@
   "version": 2,
   "builds": [
     {
-      "src": "app/main.py",
+      "src": "backend/main.py",
       "use": "@vercel/python",
       "config": {
         "runtime": "python3.9",
-        "maxLambdaSize": "15mb",
-        "includeFiles": ["app/**", "services/**", "utils/**", "models/**"]
+        "maxLambdaSize": "50mb",
+        "includeFiles": ["backend/**", "models/**", "utils/**"]
       }
     }
   ],
   "routes": [
     {
+      "src": "/api/(.*)",
+      "dest": "backend/main.py",
+      "methods": ["GET", "POST"]
+    },
+    {
       "src": "/(.*)",
-      "dest": "app/main.py"
+      "status": 404,
+      "dest": "This route is not available"
     }
   ]
 }

@@ -1,19 +1,18 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse, FileResponse
 from typing import Optional
 import logging
 import pandas as pd
 import os
+import re
+from tempfile import NamedTemporaryFile
 
-from app.services.youtube_service import YouTubeService
-from app.services.nlp_service import TextPreprocessor, EmotionAnalyzer
-from app.services.visualization import VisualizationService
-from app.config import Config
-from dotenv import load_dotenv
-
-
-load_dotenv(os.path.join(os.path.dirname(__file__), '../../.env'))
+# Importaciones relativas para compatibilidad con Vercel
+from .services.youtube_service import YouTubeService
+from .services.nlp_service import TextPreprocessor, EmotionAnalyzer
+from .services.visualization import VisualizationService
+from .config import Config
 
 # Configuración de logging
 logging.basicConfig(
@@ -37,7 +36,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/analyze")
+@app.get("/api/analyze")
 async def analyze_video(
     video_url: str = Query(..., description="YouTube video URL"),
     max_comments: Optional[int] = Query(100, description="Maximum number of comments to analyze"),
@@ -82,26 +81,30 @@ async def analyze_video(
         video_details = youtube.get_video_details(video_id)
         title = f"Emotions in comments for: {video_details.get('title', video_id)}" if video_details else None
 
-        if chart_type.lower() == "pie":
-            chart_path = visualizer.create_pie_chart(df, title)
-        else:
-            chart_path = visualizer.create_emotion_distribution_plot(df, title)
+        # Usar archivo temporal para la imagen
+        with NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
+            chart_path = tmp_file.name
+            
+            if chart_type.lower() == "pie":
+                visualizer.create_pie_chart(df, title, output_path=chart_path)
+            else:
+                visualizer.create_emotion_distribution_plot(df, title, output_path=chart_path)
 
-        if not chart_path:
-            raise HTTPException(status_code=500, detail="Error generating visualization")
-
-        # Devolver la imagen generada
-        return FileResponse(chart_path)
+            # Devolver la imagen generada
+            return FileResponse(
+                chart_path,
+                media_type='image/png',
+                headers={'Cache-Control': 'no-store'}
+            )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error in analysis: {str(e)}")
+        logger.error(f"Error in analysis: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 def extract_video_id(url: str) -> Optional[str]:
     """Extrae el ID de un video de YouTube desde su URL"""
-    import re
     patterns = [
         r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/watch\?v=([^&]+)',
         r'(?:https?:\/\/)?(?:www\.)?youtu\.be\/([^?]+)',
@@ -114,6 +117,18 @@ def extract_video_id(url: str) -> Optional[str]:
             return match.group(1)
     return None
 
+@app.get("/api/health")
+async def health_check():
+    return {"status": "ok", "message": "API is running"}
+
 @app.get("/")
 async def root():
-    return {"message": "YouTube Emotion Detection API is running"}
+    return JSONResponse(
+        content={
+            "message": "YouTube Emotion Detection API",
+            "endpoints": {
+                "/api/analyze": "POST - Analyze YouTube comments",
+                "/api/health": "GET - Health check"
+            }
+        }
+    )
